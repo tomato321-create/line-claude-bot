@@ -18,7 +18,7 @@ const auth = new google.auth.GoogleAuth({
 const calendar = google.calendar({ version: "v3", auth });
 
 // 指定された日時が空いているか確認する関数
-async function checkSpecificSlot(dateStr) {
+async function checkSpecificSlot(userMessage) {
   const now = new Date();
   const twoMonthsLater = new Date();
   twoMonthsLater.setDate(now.getDate() + 60);
@@ -32,42 +32,57 @@ async function checkSpecificSlot(dateStr) {
   });
 
   const events = response.data.items || [];
-
-  // 日付文字列から日付を推測（例：5月10日、5/10など）
   const currentYear = now.getFullYear();
   let targetDate = null;
 
-  const matchMonthDay = dateStr.match(/(\d+)月(\d+)日/);
-  const matchSlash = dateStr.match(/(\d+)\/(\d+)/);
+  // メッセージから日付部分だけを正確に抽出
+  const matchMonthDay = userMessage.match(/(\d{1,2})月(\d{1,2})日/);
+  const matchSlash = userMessage.match(/(\d{1,2})\/(\d{1,2})/);
 
   if (matchMonthDay) {
-    targetDate = new Date(currentYear, parseInt(matchMonthDay[1]) - 1, parseInt(matchMonthDay[2]));
+    const month = parseInt(matchMonthDay[1]);
+    const day = parseInt(matchMonthDay[2]);
+    if (month >= 1 && month <= 12 && day >= 1 && day <= 31) {
+      targetDate = new Date(currentYear, month - 1, day);
+    }
   } else if (matchSlash) {
-    targetDate = new Date(currentYear, parseInt(matchSlash[1]) - 1, parseInt(matchSlash[2]));
+    const month = parseInt(matchSlash[1]);
+    const day = parseInt(matchSlash[2]);
+    if (month >= 1 && month <= 12 && day >= 1 && day <= 31) {
+      targetDate = new Date(currentYear, month - 1, day);
+    }
   }
 
   if (!targetDate) return null;
 
-  // その日の予定を抽出
+  // 過去の日付は翌年に
+  if (targetDate < now) {
+    targetDate.setFullYear(currentYear + 1);
+  }
+
+  // その日の予定だけを正確に抽出
   const dayEvents = events.filter(event => {
     const start = new Date(event.start.dateTime || event.start.date);
-    return start.toDateString() === targetDate.toDateString();
+    return (
+      start.getFullYear() === targetDate.getFullYear() &&
+      start.getMonth() === targetDate.getMonth() &&
+      start.getDate() === targetDate.getDate()
+    );
   });
 
   // 時間指定があるか確認
-  const timeMatch = dateStr.match(/(\d+)時/);
+  const timeMatch = userMessage.match(/(\d{1,2})時/) || userMessage.match(/(\d{1,2}):(\d{2})/);
   if (timeMatch) {
     const targetHour = parseInt(timeMatch[1]);
-    const slotStart = new Date(targetDate);
-    slotStart.setHours(targetHour, 0, 0, 0);
-    const slotEnd = new Date(slotStart);
-    slotEnd.setHours(targetHour + 1, 0, 0, 0);
 
-    // 前後1時間バッファで確認
-    const bufferStart = new Date(slotStart);
-    bufferStart.setHours(slotStart.getHours() - 1);
-    const bufferEnd = new Date(slotEnd);
-    bufferEnd.setHours(slotEnd.getHours() + 1);
+    if (targetHour < 8 || targetHour > 20) {
+      return { date: targetDate, hour: null, dayEvents: [] };
+    }
+
+    const bufferStart = new Date(targetDate);
+    bufferStart.setHours(targetHour - 1, 0, 0, 0);
+    const bufferEnd = new Date(targetDate);
+    bufferEnd.setHours(targetHour + 2, 0, 0, 0);
 
     const conflict = dayEvents.some(event => {
       const start = new Date(event.start.dateTime || event.start.date);
@@ -82,7 +97,7 @@ async function checkSpecificSlot(dateStr) {
     };
   }
 
-  // 時間指定なしの場合はその日の空き時間を返す
+  // 時間指定なしの場合はその日の予定一覧を返す
   return {
     date: targetDate,
     hour: null,
@@ -126,9 +141,9 @@ async function getAvailableSlots() {
         slotEnd.setHours(hour + 1, 0, 0, 0);
 
         const bufferStart = new Date(slotStart);
-        bufferStart.setHours(slotStart.getHours() - 1);
+        bufferStart.setHours(hour - 1, 0, 0, 0);
         const bufferEnd = new Date(slotEnd);
-        bufferEnd.setHours(slotEnd.getHours() + 1);
+        bufferEnd.setHours(hour + 2, 0, 0, 0);
 
         const conflict = events.some(event => {
           const start = new Date(event.start.dateTime || event.start.date);
@@ -182,14 +197,13 @@ app.post("/webhook", async (req, res) => {
         userMessage.includes("ミーティング") ||
         userMessage.includes("会議");
 
-      const hasSpecificDate = /\d+月\d+日|\d+\/\d+/.test(userMessage);
+      const hasSpecificDate = /(\d{1,2})月(\d{1,2})日|(\d{1,2})\/(\d{1,2})/.test(userMessage);
 
       let calendarInfo = "";
 
       if (isScheduleRequest || hasSpecificDate) {
         try {
           if (hasSpecificDate) {
-            // 指定日時をカレンダーで直接確認
             const result = await checkSpecificSlot(userMessage);
 
             if (result) {
@@ -198,14 +212,12 @@ app.post("/webhook", async (req, res) => {
               });
 
               if (result.hour !== null) {
-                // 時間も指定されている場合
                 if (result.available) {
                   calendarInfo = `\n\n【カレンダー確認結果】\n${dateLabel} ${result.hour}:00〜${result.hour + 1}:00 は空いております。`;
                 } else {
                   calendarInfo = `\n\n【カレンダー確認結果】\n${dateLabel} ${result.hour}:00〜${result.hour + 1}:00 はすでに予定が入っております。`;
                 }
               } else {
-                // 日付のみ指定の場合
                 if (result.dayEvents && result.dayEvents.length > 0) {
                   const eventList = result.dayEvents.map(e => `・${e.start}〜${e.end} ${e.title}`).join("\n");
                   calendarInfo = `\n\n【カレンダー確認結果】\n${dateLabel}の予定：\n${eventList}`;
@@ -221,7 +233,6 @@ app.post("/webhook", async (req, res) => {
               }
             }
           } else {
-            // 日程調整の一般依頼は空き候補を提示
             const slots = await getAvailableSlots();
             if (slots.length > 0) {
               calendarInfo = `\n\n【空き日程候補】\n${slots.join("\n")}`;
