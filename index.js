@@ -17,8 +17,30 @@ const auth = new google.auth.GoogleAuth({
 
 const calendar = google.calendar({ version: "v3", auth });
 
-// 指定された日時が空いているか確認する関数
-async function checkSpecificSlot(userMessage) {
+// 日本時間に変換するヘルパー関数
+function toJST(date) {
+  const jst = new Date(date.getTime() + 9 * 60 * 60 * 1000);
+  return jst;
+}
+
+function getJSTHour(date) {
+  return toJST(date).getUTCHours();
+}
+
+function getJSTDateString(date) {
+  const jst = toJST(date);
+  return `${jst.getUTCFullYear()}-${jst.getUTCMonth() + 1}-${jst.getUTCDate()}`;
+}
+
+function formatJSTTime(date) {
+  const jst = toJST(date);
+  const h = String(jst.getUTCHours()).padStart(2, "0");
+  const m = String(jst.getUTCMinutes()).padStart(2, "0");
+  return `${h}:${m}`;
+}
+
+// カレンダーのイベントを取得する共通関数
+async function fetchEvents() {
   const now = new Date();
   const twoMonthsLater = new Date();
   twoMonthsLater.setDate(now.getDate() + 60);
@@ -28,70 +50,62 @@ async function checkSpecificSlot(userMessage) {
     timeMin: now.toISOString(),
     timeMax: twoMonthsLater.toISOString(),
     singleEvents: true,
-    orderBy: "startTime"
+    orderBy: "startTime",
+    timeZone: "Asia/Tokyo"
   });
 
-  const events = response.data.items || [];
-  const currentYear = now.getFullYear();
-  let targetDate = null;
+  return response.data.items || [];
+}
 
-  // メッセージから日付部分だけを正確に抽出
+// 指定された日時が空いているか確認する関数
+async function checkSpecificSlot(userMessage) {
+  const events = await fetchEvents();
+  const now = new Date();
+  const currentYear = now.getFullYear();
+  let targetMonth = null;
+  let targetDay = null;
+
   const matchMonthDay = userMessage.match(/(\d{1,2})月(\d{1,2})日/);
   const matchSlash = userMessage.match(/(\d{1,2})\/(\d{1,2})/);
 
   if (matchMonthDay) {
-    const month = parseInt(matchMonthDay[1]);
-    const day = parseInt(matchMonthDay[2]);
-    if (month >= 1 && month <= 12 && day >= 1 && day <= 31) {
-      targetDate = new Date(currentYear, month - 1, day);
-    }
+    targetMonth = parseInt(matchMonthDay[1]);
+    targetDay = parseInt(matchMonthDay[2]);
   } else if (matchSlash) {
-    const month = parseInt(matchSlash[1]);
-    const day = parseInt(matchSlash[2]);
-    if (month >= 1 && month <= 12 && day >= 1 && day <= 31) {
-      targetDate = new Date(currentYear, month - 1, day);
-    }
+    targetMonth = parseInt(matchSlash[1]);
+    targetDay = parseInt(matchSlash[2]);
   }
 
-  if (!targetDate) return null;
+  if (!targetMonth || !targetDay) return null;
+  if (targetMonth < 1 || targetMonth > 12 || targetDay < 1 || targetDay > 31) return null;
 
-  // 過去の日付は翌年に
-  if (targetDate < now) {
-    targetDate.setFullYear(currentYear + 1);
-  }
+  // 対象日のJST日付文字列
+  let targetYear = currentYear;
+  const targetDateCheck = new Date(currentYear, targetMonth - 1, targetDay);
+  if (targetDateCheck < now) targetYear = currentYear + 1;
+  const targetDateStr = `${targetYear}-${targetMonth}-${targetDay}`;
 
-  // その日の予定だけを正確に抽出
+  // その日のJST予定を抽出
   const dayEvents = events.filter(event => {
     const start = new Date(event.start.dateTime || event.start.date);
-    return (
-      start.getFullYear() === targetDate.getFullYear() &&
-      start.getMonth() === targetDate.getMonth() &&
-      start.getDate() === targetDate.getDate()
-    );
+    return getJSTDateString(start) === targetDateStr;
   });
 
   // 時間指定があるか確認
   const timeMatch = userMessage.match(/(\d{1,2})時/) || userMessage.match(/(\d{1,2}):(\d{2})/);
   if (timeMatch) {
     const targetHour = parseInt(timeMatch[1]);
+    if (targetHour < 8 || targetHour > 20) return null;
 
-    if (targetHour < 8 || targetHour > 20) {
-      return { date: targetDate, hour: null, dayEvents: [] };
-    }
-
-    const bufferStart = new Date(targetDate);
-    bufferStart.setHours(targetHour - 1, 0, 0, 0);
-    const bufferEnd = new Date(targetDate);
-    bufferEnd.setHours(targetHour + 2, 0, 0, 0);
-
+    // 前後1時間バッファで空き確認
     const conflict = dayEvents.some(event => {
-      const start = new Date(event.start.dateTime || event.start.date);
-      const end = new Date(event.end.dateTime || event.end.date);
-      return start < bufferEnd && end > bufferStart;
+      const startHour = getJSTHour(new Date(event.start.dateTime || event.start.date));
+      const endHour = getJSTHour(new Date(event.end.dateTime || event.end.date));
+      return startHour < targetHour + 2 && endHour > targetHour - 1;
     });
 
     return {
-      date: targetDate,
+      dateLabel: `${targetMonth}月${targetDay}日`,
       hour: targetHour,
       available: !conflict
     };
@@ -99,63 +113,57 @@ async function checkSpecificSlot(userMessage) {
 
   // 時間指定なしの場合はその日の予定一覧を返す
   return {
-    date: targetDate,
+    dateLabel: `${targetMonth}月${targetDay}日`,
     hour: null,
     dayEvents: dayEvents.map(e => ({
       title: e.summary || "予定あり",
-      start: new Date(e.start.dateTime || e.start.date).toLocaleTimeString("ja-JP", { hour: "2-digit", minute: "2-digit" }),
-      end: new Date(e.end.dateTime || e.end.date).toLocaleTimeString("ja-JP", { hour: "2-digit", minute: "2-digit" })
+      start: formatJSTTime(new Date(e.start.dateTime || e.start.date)),
+      end: formatJSTTime(new Date(e.end.dateTime || e.end.date))
     }))
   };
 }
 
 // 空き日程候補を自動で探す関数
 async function getAvailableSlots() {
+  const events = await fetchEvents();
   const now = new Date();
   const twoMonthsLater = new Date();
   twoMonthsLater.setDate(now.getDate() + 60);
 
-  const response = await calendar.events.list({
-    calendarId: CALENDAR_ID,
-    timeMin: now.toISOString(),
-    timeMax: twoMonthsLater.toISOString(),
-    singleEvents: true,
-    orderBy: "startTime"
-  });
-
-  const events = response.data.items || [];
   const candidates = [];
   const checkDate = new Date(now);
-  checkDate.setHours(10, 0, 0, 0);
+  checkDate.setHours(1, 0, 0, 0); // JSTの10:00 = UTC 01:00
 
   while (candidates.length < 3 && checkDate < twoMonthsLater) {
-    const dayOfWeek = checkDate.getDay();
+    const jstDate = toJST(checkDate);
+    const dayOfWeek = jstDate.getUTCDay();
 
     if (dayOfWeek !== 0 && dayOfWeek !== 6) {
-      const slots = [10, 14];
+      const jstSlots = [10, 14]; // 日本時間で確認したい時間帯
 
-      for (const hour of slots) {
-        const slotStart = new Date(checkDate);
-        slotStart.setHours(hour, 0, 0, 0);
-        const slotEnd = new Date(slotStart);
-        slotEnd.setHours(hour + 1, 0, 0, 0);
+      for (const jstHour of jstSlots) {
+        // JSTのjstHour時 = UTCの(jstHour-9)時
+        const slotStartUTC = new Date(checkDate);
+        slotStartUTC.setUTCHours(jstHour - 9, 0, 0, 0);
 
-        const bufferStart = new Date(slotStart);
-        bufferStart.setHours(hour - 1, 0, 0, 0);
-        const bufferEnd = new Date(slotEnd);
-        bufferEnd.setHours(hour + 2, 0, 0, 0);
+        if (slotStartUTC <= now) continue;
 
+        // 前後1時間バッファで空き確認
         const conflict = events.some(event => {
           const start = new Date(event.start.dateTime || event.start.date);
           const end = new Date(event.end.dateTime || event.end.date);
+          const bufferStart = new Date(slotStartUTC.getTime() - 60 * 60 * 1000);
+          const bufferEnd = new Date(slotStartUTC.getTime() + 2 * 60 * 60 * 1000);
           return start < bufferEnd && end > bufferStart;
         });
 
-        if (!conflict && slotStart > now) {
-          const dateStr = slotStart.toLocaleDateString("ja-JP", {
-            month: "long", day: "numeric", weekday: "short"
-          });
-          candidates.push(`・${dateStr} ${hour}:00〜${hour + 1}:00`);
+        if (!conflict) {
+          const jst = toJST(slotStartUTC);
+          const month = jst.getUTCMonth() + 1;
+          const day = jst.getUTCDate();
+          const weekdays = ["日", "月", "火", "水", "木", "金", "土"];
+          const weekday = weekdays[jst.getUTCDay()];
+          candidates.push(`・${month}月${day}日（${weekday}） ${jstHour}:00〜${jstHour + 1}:00`);
           if (candidates.length >= 3) break;
         }
       }
@@ -190,7 +198,8 @@ app.post("/webhook", async (req, res) => {
 
       console.log(`会員メッセージ: ${userMessage}`);
 
-      const isScheduleRequest = userMessage.includes("日程") ||
+      const isScheduleRequest =
+        userMessage.includes("日程") ||
         userMessage.includes("スケジュール") ||
         userMessage.includes("予定") ||
         userMessage.includes("打ち合わせ") ||
@@ -207,26 +216,21 @@ app.post("/webhook", async (req, res) => {
             const result = await checkSpecificSlot(userMessage);
 
             if (result) {
-              const dateLabel = result.date.toLocaleDateString("ja-JP", {
-                month: "long", day: "numeric", weekday: "short"
-              });
-
               if (result.hour !== null) {
                 if (result.available) {
-                  calendarInfo = `\n\n【カレンダー確認結果】\n${dateLabel} ${result.hour}:00〜${result.hour + 1}:00 は空いております。`;
+                  calendarInfo = `\n\n【カレンダー確認結果】\n${result.dateLabel} ${result.hour}:00〜${result.hour + 1}:00 は空いております。`;
                 } else {
-                  calendarInfo = `\n\n【カレンダー確認結果】\n${dateLabel} ${result.hour}:00〜${result.hour + 1}:00 はすでに予定が入っております。`;
+                  calendarInfo = `\n\n【カレンダー確認結果】\n${result.dateLabel} ${result.hour}:00〜${result.hour + 1}:00 はすでに予定が入っております。`;
                 }
               } else {
                 if (result.dayEvents && result.dayEvents.length > 0) {
                   const eventList = result.dayEvents.map(e => `・${e.start}〜${e.end} ${e.title}`).join("\n");
-                  calendarInfo = `\n\n【カレンダー確認結果】\n${dateLabel}の予定：\n${eventList}`;
+                  calendarInfo = `\n\n【カレンダー確認結果】\n${result.dateLabel}の予定：\n${eventList}`;
                 } else {
-                  calendarInfo = `\n\n【カレンダー確認結果】\n${dateLabel}は現在予定が入っておりません。`;
+                  calendarInfo = `\n\n【カレンダー確認結果】\n${result.dateLabel}は現在予定が入っておりません。`;
                 }
               }
 
-              // 空き候補も併せて提示
               const slots = await getAvailableSlots();
               if (slots.length > 0) {
                 calendarInfo += `\n\n【その他の空き日程候補】\n${slots.join("\n")}`;
