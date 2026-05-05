@@ -7,7 +7,6 @@ app.use(express.json());
 
 const conversations = new Map();
 
-// Googleカレンダーの設定
 const CALENDAR_ID = process.env.GOOGLE_CALENDAR_ID;
 const credentials = JSON.parse(process.env.GOOGLE_CREDENTIALS);
 
@@ -18,33 +17,107 @@ const auth = new google.auth.GoogleAuth({
 
 const calendar = google.calendar({ version: "v3", auth });
 
-// カレンダーの空き時間を取得する関数
-async function getAvailableSlots() {
+// 指定された日時が空いているか確認する関数
+async function checkSpecificSlot(dateStr) {
   const now = new Date();
-  const oneWeekLater = new Date();
-  oneWeekLater.setDate(now.getDate() + 14);
+  const twoMonthsLater = new Date();
+  twoMonthsLater.setDate(now.getDate() + 60);
 
   const response = await calendar.events.list({
     calendarId: CALENDAR_ID,
     timeMin: now.toISOString(),
-    timeMax: oneWeekLater.toISOString(),
+    timeMax: twoMonthsLater.toISOString(),
     singleEvents: true,
     orderBy: "startTime"
   });
 
   const events = response.data.items || [];
 
-  // 平日の9時〜18時の中から候補を探す
+  // 日付文字列から日付を推測（例：5月10日、5/10など）
+  const currentYear = now.getFullYear();
+  let targetDate = null;
+
+  const matchMonthDay = dateStr.match(/(\d+)月(\d+)日/);
+  const matchSlash = dateStr.match(/(\d+)\/(\d+)/);
+
+  if (matchMonthDay) {
+    targetDate = new Date(currentYear, parseInt(matchMonthDay[1]) - 1, parseInt(matchMonthDay[2]));
+  } else if (matchSlash) {
+    targetDate = new Date(currentYear, parseInt(matchSlash[1]) - 1, parseInt(matchSlash[2]));
+  }
+
+  if (!targetDate) return null;
+
+  // その日の予定を抽出
+  const dayEvents = events.filter(event => {
+    const start = new Date(event.start.dateTime || event.start.date);
+    return start.toDateString() === targetDate.toDateString();
+  });
+
+  // 時間指定があるか確認
+  const timeMatch = dateStr.match(/(\d+)時/);
+  if (timeMatch) {
+    const targetHour = parseInt(timeMatch[1]);
+    const slotStart = new Date(targetDate);
+    slotStart.setHours(targetHour, 0, 0, 0);
+    const slotEnd = new Date(slotStart);
+    slotEnd.setHours(targetHour + 1, 0, 0, 0);
+
+    // 前後1時間バッファで確認
+    const bufferStart = new Date(slotStart);
+    bufferStart.setHours(slotStart.getHours() - 1);
+    const bufferEnd = new Date(slotEnd);
+    bufferEnd.setHours(slotEnd.getHours() + 1);
+
+    const conflict = dayEvents.some(event => {
+      const start = new Date(event.start.dateTime || event.start.date);
+      const end = new Date(event.end.dateTime || event.end.date);
+      return start < bufferEnd && end > bufferStart;
+    });
+
+    return {
+      date: targetDate,
+      hour: targetHour,
+      available: !conflict
+    };
+  }
+
+  // 時間指定なしの場合はその日の空き時間を返す
+  return {
+    date: targetDate,
+    hour: null,
+    dayEvents: dayEvents.map(e => ({
+      title: e.summary || "予定あり",
+      start: new Date(e.start.dateTime || e.start.date).toLocaleTimeString("ja-JP", { hour: "2-digit", minute: "2-digit" }),
+      end: new Date(e.end.dateTime || e.end.date).toLocaleTimeString("ja-JP", { hour: "2-digit", minute: "2-digit" })
+    }))
+  };
+}
+
+// 空き日程候補を自動で探す関数
+async function getAvailableSlots() {
+  const now = new Date();
+  const twoMonthsLater = new Date();
+  twoMonthsLater.setDate(now.getDate() + 60);
+
+  const response = await calendar.events.list({
+    calendarId: CALENDAR_ID,
+    timeMin: now.toISOString(),
+    timeMax: twoMonthsLater.toISOString(),
+    singleEvents: true,
+    orderBy: "startTime"
+  });
+
+  const events = response.data.items || [];
   const candidates = [];
   const checkDate = new Date(now);
-  checkDate.setHours(9, 0, 0, 0);
+  checkDate.setHours(10, 0, 0, 0);
 
-  while (candidates.length < 5 && checkDate < oneWeekLater) {
+  while (candidates.length < 3 && checkDate < twoMonthsLater) {
     const dayOfWeek = checkDate.getDay();
 
-    // 土日はスキップ
     if (dayOfWeek !== 0 && dayOfWeek !== 6) {
-      const slots = [9, 11, 14, 16]; // 確認する時間帯
+      const slots = [10, 14];
 
       for (const hour of slots) {
         const slotStart = new Date(checkDate);
@@ -52,7 +125,6 @@ async function getAvailableSlots() {
         const slotEnd = new Date(slotStart);
         slotEnd.setHours(hour + 1, 0, 0, 0);
 
-        // 前後1時間を含めた範囲で予定が入っていないか確認
         const bufferStart = new Date(slotStart);
         bufferStart.setHours(slotStart.getHours() - 1);
         const bufferEnd = new Date(slotEnd);
@@ -68,10 +140,8 @@ async function getAvailableSlots() {
           const dateStr = slotStart.toLocaleDateString("ja-JP", {
             month: "long", day: "numeric", weekday: "short"
           });
-          const timeStr = `${hour}:00〜${hour + 1}:00`;
-          candidates.push(`・${dateStr} ${timeStr}`);
-
-          if (candidates.length >= 5) break;
+          candidates.push(`・${dateStr} ${hour}:00〜${hour + 1}:00`);
+          if (candidates.length >= 3) break;
         }
       }
     }
@@ -84,7 +154,12 @@ async function getAvailableSlots() {
 
 const SYSTEM_PROMPT = `あなたはSBG（経営者団体）のLINE公式アカウントを運営するサポートエージェントです。会員からのメッセージに対応し、以下の業務を自動で行います：イベントや会議の日程候補の提示と仮調整、よくある質問への回答、会員向けお知らせの配信。
 
-日程調整の依頼があった場合は、提示された候補日程をそのまま伝えてください。候補日程を提示した後は必ず「スタッフより改めて最終確認のご連絡をいたします」とお伝えください。
+日程調整について：
+- 会員から日程調整の依頼があった場合、提供された空き日程候補をそのまま丁寧に伝えてください
+- 会員が特定の日時を指定してきた場合、カレンダー確認結果をそのまま伝えてください
+- 空いている場合は「その日時は空いております」と伝え、別途空き候補も提示してください
+- 埋まっている場合は「その日時はすでに予定が入っております」と伝え、代わりの空き候補を提示してください
+- 候補を提示した後は必ず「スタッフより改めて最終確認のご連絡をいたします」とお伝えください
 
 資料・ドキュメントの送付依頼はスタッフにエスカレーションする旨を伝えてください。対応できない内容もスタッフにエスカレーションする旨を伝えてください。常に丁寧でプロフェッショナルな日本語で対応し、SBGの品格を保ちます。`;
 
@@ -100,7 +175,6 @@ app.post("/webhook", async (req, res) => {
 
       console.log(`会員メッセージ: ${userMessage}`);
 
-      // 日程調整の依頼かどうか判定
       const isScheduleRequest = userMessage.includes("日程") ||
         userMessage.includes("スケジュール") ||
         userMessage.includes("予定") ||
@@ -108,21 +182,59 @@ app.post("/webhook", async (req, res) => {
         userMessage.includes("ミーティング") ||
         userMessage.includes("会議");
 
+      const hasSpecificDate = /\d+月\d+日|\d+\/\d+/.test(userMessage);
+
       let calendarInfo = "";
-      if (isScheduleRequest) {
+
+      if (isScheduleRequest || hasSpecificDate) {
         try {
-          const slots = await getAvailableSlots();
-          if (slots.length > 0) {
-            calendarInfo = `\n\n【現在の空き日程候補】\n${slots.join("\n")}`;
+          if (hasSpecificDate) {
+            // 指定日時をカレンダーで直接確認
+            const result = await checkSpecificSlot(userMessage);
+
+            if (result) {
+              const dateLabel = result.date.toLocaleDateString("ja-JP", {
+                month: "long", day: "numeric", weekday: "short"
+              });
+
+              if (result.hour !== null) {
+                // 時間も指定されている場合
+                if (result.available) {
+                  calendarInfo = `\n\n【カレンダー確認結果】\n${dateLabel} ${result.hour}:00〜${result.hour + 1}:00 は空いております。`;
+                } else {
+                  calendarInfo = `\n\n【カレンダー確認結果】\n${dateLabel} ${result.hour}:00〜${result.hour + 1}:00 はすでに予定が入っております。`;
+                }
+              } else {
+                // 日付のみ指定の場合
+                if (result.dayEvents && result.dayEvents.length > 0) {
+                  const eventList = result.dayEvents.map(e => `・${e.start}〜${e.end} ${e.title}`).join("\n");
+                  calendarInfo = `\n\n【カレンダー確認結果】\n${dateLabel}の予定：\n${eventList}`;
+                } else {
+                  calendarInfo = `\n\n【カレンダー確認結果】\n${dateLabel}は現在予定が入っておりません。`;
+                }
+              }
+
+              // 空き候補も併せて提示
+              const slots = await getAvailableSlots();
+              if (slots.length > 0) {
+                calendarInfo += `\n\n【その他の空き日程候補】\n${slots.join("\n")}`;
+              }
+            }
+          } else {
+            // 日程調整の一般依頼は空き候補を提示
+            const slots = await getAvailableSlots();
+            if (slots.length > 0) {
+              calendarInfo = `\n\n【空き日程候補】\n${slots.join("\n")}`;
+            }
           }
         } catch (error) {
           console.error("カレンダーエラー:", error);
+          calendarInfo = "\n\n【カレンダー確認中にエラーが発生しました。スタッフより確認のご連絡をいたします。】";
         }
       }
 
       const reply = await askClaude(userId, userMessage, calendarInfo);
       console.log(`返答: ${reply}`);
-
       await replyToLine(replyToken, reply);
     }
   }
