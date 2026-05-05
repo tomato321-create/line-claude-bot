@@ -17,28 +17,6 @@ const auth = new google.auth.GoogleAuth({
 
 const calendar = google.calendar({ version: "v3", auth });
 
-// 日本時間に変換するヘルパー関数
-function toJST(date) {
-  const jst = new Date(date.getTime() + 9 * 60 * 60 * 1000);
-  return jst;
-}
-
-function getJSTHour(date) {
-  return toJST(date).getUTCHours();
-}
-
-function getJSTDateString(date) {
-  const jst = toJST(date);
-  return `${jst.getUTCFullYear()}-${jst.getUTCMonth() + 1}-${jst.getUTCDate()}`;
-}
-
-function formatJSTTime(date) {
-  const jst = toJST(date);
-  const h = String(jst.getUTCHours()).padStart(2, "0");
-  const m = String(jst.getUTCMinutes()).padStart(2, "0");
-  return `${h}:${m}`;
-}
-
 // カレンダーのイベントを取得する共通関数
 async function fetchEvents() {
   const now = new Date();
@@ -57,11 +35,82 @@ async function fetchEvents() {
   return response.data.items || [];
 }
 
+// 空き日程候補を自動で探す関数（日本時間で処理）
+async function getAvailableSlots() {
+  const events = await fetchEvents();
+
+  // 各イベントの開始・終了を日本時間のDateオブジェクトとして持っておく
+  const eventTimes = events.map(event => ({
+    start: new Date(event.start.dateTime || event.start.date),
+    end: new Date(event.end.dateTime || event.end.date)
+  }));
+
+  const candidates = [];
+
+  // 今日から60日先まで1日ずつ確認
+  const now = new Date();
+  const nowJST = new Date(now.toLocaleString("en-US", { timeZone: "Asia/Tokyo" }));
+
+  for (let dayOffset = 0; dayOffset <= 60 && candidates.length < 3; dayOffset++) {
+    const checkDay = new Date(nowJST);
+    checkDay.setDate(nowJST.getDate() + dayOffset);
+
+    // 土日はスキップ
+    const dayOfWeek = checkDay.getDay();
+    if (dayOfWeek === 0 || dayOfWeek === 6) continue;
+
+    // 10時と14時を候補として確認
+    for (const hour of [10, 14]) {
+      // 候補スロットの開始・終了（日本時間）
+      const slotStart = new Date(checkDay);
+      slotStart.setHours(hour, 0, 0, 0);
+
+      const slotEnd = new Date(checkDay);
+      slotEnd.setHours(hour + 1, 0, 0, 0);
+
+      // 過去はスキップ
+      if (slotStart <= nowJST) continue;
+
+      // 前後1時間バッファ
+      const bufferStart = new Date(slotStart);
+      bufferStart.setHours(hour - 1, 0, 0, 0);
+
+      const bufferEnd = new Date(slotEnd);
+      bufferEnd.setHours(hour + 2, 0, 0, 0);
+
+      // バッファ範囲内に予定が入っていないか確認
+      const conflict = eventTimes.some(event =>
+        event.start < bufferEnd && event.end > bufferStart
+      );
+
+      if (!conflict) {
+        const weekdays = ["日", "月", "火", "水", "木", "金", "土"];
+        const month = checkDay.getMonth() + 1;
+        const day = checkDay.getDate();
+        const weekday = weekdays[checkDay.getDay()];
+        candidates.push(`・${month}月${day}日（${weekday}） ${hour}:00〜${hour + 1}:00`);
+        if (candidates.length >= 3) break;
+      }
+    }
+  }
+
+  return candidates;
+}
+
 // 指定された日時が空いているか確認する関数
 async function checkSpecificSlot(userMessage) {
   const events = await fetchEvents();
+
+  const eventTimes = events.map(event => ({
+    start: new Date(event.start.dateTime || event.start.date),
+    end: new Date(event.end.dateTime || event.end.date),
+    title: event.summary || "予定あり"
+  }));
+
   const now = new Date();
-  const currentYear = now.getFullYear();
+  const nowJST = new Date(now.toLocaleString("en-US", { timeZone: "Asia/Tokyo" }));
+  const currentYear = nowJST.getFullYear();
+
   let targetMonth = null;
   let targetDay = null;
 
@@ -79,16 +128,21 @@ async function checkSpecificSlot(userMessage) {
   if (!targetMonth || !targetDay) return null;
   if (targetMonth < 1 || targetMonth > 12 || targetDay < 1 || targetDay > 31) return null;
 
-  // 対象日のJST日付文字列
+  // 対象日のDateオブジェクト（日本時間）
   let targetYear = currentYear;
-  const targetDateCheck = new Date(currentYear, targetMonth - 1, targetDay);
-  if (targetDateCheck < now) targetYear = currentYear + 1;
-  const targetDateStr = `${targetYear}-${targetMonth}-${targetDay}`;
+  const targetDate = new Date(currentYear, targetMonth - 1, targetDay, 0, 0, 0, 0);
+  if (targetDate < nowJST) targetYear = currentYear + 1;
 
-  // その日のJST予定を抽出
-  const dayEvents = events.filter(event => {
-    const start = new Date(event.start.dateTime || event.start.date);
-    return getJSTDateString(start) === targetDateStr;
+  const targetDateFinal = new Date(targetYear, targetMonth - 1, targetDay, 0, 0, 0, 0);
+
+  // その日の予定を抽出
+  const dayEvents = eventTimes.filter(event => {
+    const eventDateJST = new Date(event.start.toLocaleString("en-US", { timeZone: "Asia/Tokyo" }));
+    return (
+      eventDateJST.getFullYear() === targetYear &&
+      eventDateJST.getMonth() === targetMonth - 1 &&
+      eventDateJST.getDate() === targetDay
+    );
   });
 
   // 時間指定があるか確認
@@ -97,11 +151,19 @@ async function checkSpecificSlot(userMessage) {
     const targetHour = parseInt(timeMatch[1]);
     if (targetHour < 8 || targetHour > 20) return null;
 
-    // 前後1時間バッファで空き確認
-    const conflict = dayEvents.some(event => {
-      const startHour = getJSTHour(new Date(event.start.dateTime || event.start.date));
-      const endHour = getJSTHour(new Date(event.end.dateTime || event.end.date));
-      return startHour < targetHour + 2 && endHour > targetHour - 1;
+    const slotStart = new Date(targetDateFinal);
+    slotStart.setHours(targetHour, 0, 0, 0);
+
+    const bufferStart = new Date(targetDateFinal);
+    bufferStart.setHours(targetHour - 1, 0, 0, 0);
+
+    const bufferEnd = new Date(targetDateFinal);
+    bufferEnd.setHours(targetHour + 2, 0, 0, 0);
+
+    const conflict = eventTimes.some(event => {
+      const startJST = new Date(event.start.toLocaleString("en-US", { timeZone: "Asia/Tokyo" }));
+      const endJST = new Date(event.end.toLocaleString("en-US", { timeZone: "Asia/Tokyo" }));
+      return startJST < bufferEnd && endJST > bufferStart;
     });
 
     return {
@@ -115,64 +177,16 @@ async function checkSpecificSlot(userMessage) {
   return {
     dateLabel: `${targetMonth}月${targetDay}日`,
     hour: null,
-    dayEvents: dayEvents.map(e => ({
-      title: e.summary || "予定あり",
-      start: formatJSTTime(new Date(e.start.dateTime || e.start.date)),
-      end: formatJSTTime(new Date(e.end.dateTime || e.end.date))
-    }))
+    dayEvents: dayEvents.map(e => {
+      const startJST = new Date(e.start.toLocaleString("en-US", { timeZone: "Asia/Tokyo" }));
+      const endJST = new Date(e.end.toLocaleString("en-US", { timeZone: "Asia/Tokyo" }));
+      return {
+        title: e.title,
+        start: `${String(startJST.getHours()).padStart(2, "0")}:${String(startJST.getMinutes()).padStart(2, "0")}`,
+        end: `${String(endJST.getHours()).padStart(2, "0")}:${String(endJST.getMinutes()).padStart(2, "0")}`
+      };
+    })
   };
-}
-
-// 空き日程候補を自動で探す関数
-async function getAvailableSlots() {
-  const events = await fetchEvents();
-  const now = new Date();
-  const twoMonthsLater = new Date();
-  twoMonthsLater.setDate(now.getDate() + 60);
-
-  const candidates = [];
-  const checkDate = new Date(now);
-  checkDate.setHours(1, 0, 0, 0); // JSTの10:00 = UTC 01:00
-
-  while (candidates.length < 3 && checkDate < twoMonthsLater) {
-    const jstDate = toJST(checkDate);
-    const dayOfWeek = jstDate.getUTCDay();
-
-    if (dayOfWeek !== 0 && dayOfWeek !== 6) {
-      const jstSlots = [10, 14]; // 日本時間で確認したい時間帯
-
-      for (const jstHour of jstSlots) {
-        // JSTのjstHour時 = UTCの(jstHour-9)時
-        const slotStartUTC = new Date(checkDate);
-        slotStartUTC.setUTCHours(jstHour - 9, 0, 0, 0);
-
-        if (slotStartUTC <= now) continue;
-
-        // 前後1時間バッファで空き確認
-        const conflict = events.some(event => {
-          const start = new Date(event.start.dateTime || event.start.date);
-          const end = new Date(event.end.dateTime || event.end.date);
-          const bufferStart = new Date(slotStartUTC.getTime() - 60 * 60 * 1000);
-          const bufferEnd = new Date(slotStartUTC.getTime() + 2 * 60 * 60 * 1000);
-          return start < bufferEnd && end > bufferStart;
-        });
-
-        if (!conflict) {
-          const jst = toJST(slotStartUTC);
-          const month = jst.getUTCMonth() + 1;
-          const day = jst.getUTCDate();
-          const weekdays = ["日", "月", "火", "水", "木", "金", "土"];
-          const weekday = weekdays[jst.getUTCDay()];
-          candidates.push(`・${month}月${day}日（${weekday}） ${jstHour}:00〜${jstHour + 1}:00`);
-          if (candidates.length >= 3) break;
-        }
-      }
-    }
-
-    checkDate.setDate(checkDate.getDate() + 1);
-  }
-
-  return candidates;
 }
 
 const SYSTEM_PROMPT = `あなたはSBG（経営者団体）のLINE公式アカウントを運営するサポートエージェントです。会員からのメッセージに対応し、以下の業務を自動で行います：イベントや会議の日程候補の提示と仮調整、よくある質問への回答、会員向けお知らせの配信。
