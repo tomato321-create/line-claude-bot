@@ -17,8 +17,15 @@ const auth = new google.auth.GoogleAuth({
 
 const calendar = google.calendar({ version: "v3", auth });
 
-// カレンダーの予定を日本時間で取得してテキスト化する
-async function getCalendarText() {
+function nowJST() {
+  return new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Tokyo" }));
+}
+
+function toJSTDate(date) {
+  return new Date(date.toLocaleString("en-US", { timeZone: "Asia/Tokyo" }));
+}
+
+async function fetchEvents() {
   const now = new Date();
   const twoMonthsLater = new Date();
   twoMonthsLater.setDate(now.getDate() + 60);
@@ -32,71 +39,127 @@ async function getCalendarText() {
     timeZone: "Asia/Tokyo"
   });
 
-  const events = response.data.items || [];
+  return response.data.items || [];
+}
 
-  if (events.length === 0) {
-    return "今後60日間の予定はありません。";
-  }
+async function computeAvailableSlots() {
+  const events = await fetchEvents();
+  const jstNow = nowJST();
 
-  const lines = events.map(event => {
-    const start = new Date(event.start.dateTime || event.start.date);
-    const end = new Date(event.end.dateTime || event.end.date);
-
-    const startJST = start.toLocaleString("ja-JP", {
-      timeZone: "Asia/Tokyo",
-      month: "long",
-      day: "numeric",
-      weekday: "short",
-      hour: "2-digit",
-      minute: "2-digit"
-    });
-    const endJST = end.toLocaleString("ja-JP", {
-      timeZone: "Asia/Tokyo",
-      hour: "2-digit",
-      minute: "2-digit"
-    });
-
-    return `・${startJST}〜${endJST} ${event.summary || "予定あり"}`;
+  const blockedRanges = events.map(event => {
+    const start = toJSTDate(new Date(event.start.dateTime || event.start.date));
+    const end = toJSTDate(new Date(event.end.dateTime || event.end.date));
+    const blockStart = new Date(start.getTime() - 60 * 60 * 1000);
+    const blockEnd = new Date(end.getTime() + 60 * 60 * 1000);
+    return { blockStart, blockEnd };
   });
 
-  return lines.join("\n");
+  const candidates = [];
+
+  for (let dayOffset = 0; dayOffset <= 60 && candidates.length < 5; dayOffset++) {
+    const checkDay = new Date(jstNow);
+    checkDay.setDate(jstNow.getDate() + dayOffset);
+    checkDay.setHours(0, 0, 0, 0);
+
+    if (checkDay.getDay() === 0 || checkDay.getDay() === 6) continue;
+
+    const daySlots = [];
+    for (let hour = 9; hour <= 16; hour++) {
+      const slotStart = new Date(checkDay);
+      slotStart.setHours(hour, 0, 0, 0);
+      const slotEnd = new Date(checkDay);
+      slotEnd.setHours(hour + 1, 0, 0, 0);
+
+      if (slotStart <= jstNow) continue;
+
+      const isBlocked = blockedRanges.some(range =>
+        slotStart < range.blockEnd && slotEnd > range.blockStart
+      );
+
+      if (!isBlocked) {
+        daySlots.push(`${hour}:00〜${hour + 1}:00`);
+      }
+    }
+
+    if (daySlots.length > 0) {
+      const weekdays = ["日", "月", "火", "水", "木", "金", "土"];
+      const month = checkDay.getMonth() + 1;
+      const day = checkDay.getDate();
+      const weekday = weekdays[checkDay.getDay()];
+      candidates.push(`${month}月${day}日（${weekday}）：${daySlots.join("、")}`);
+    }
+  }
+
+  return candidates;
+}
+
+async function checkSpecificDateTime(userMessage) {
+  const events = await fetchEvents();
+  const jstNow = nowJST();
+
+  const blockedRanges = events.map(event => {
+    const start = toJSTDate(new Date(event.start.dateTime || event.start.date));
+    const end = toJSTDate(new Date(event.end.dateTime || event.end.date));
+    const blockStart = new Date(start.getTime() - 60 * 60 * 1000);
+    const blockEnd = new Date(end.getTime() + 60 * 60 * 1000);
+    return { blockStart, blockEnd };
+  });
+
+  const matchMonthDay = userMessage.match(/(\d{1,2})月(\d{1,2})日/);
+  const matchSlash = userMessage.match(/(\d{1,2})\/(\d{1,2})/);
+  let targetMonth = null, targetDay = null;
+
+  if (matchMonthDay) {
+    targetMonth = parseInt(matchMonthDay[1]);
+    targetDay = parseInt(matchMonthDay[2]);
+  } else if (matchSlash) {
+    targetMonth = parseInt(matchSlash[1]);
+    targetDay = parseInt(matchSlash[2]);
+  }
+
+  if (!targetMonth || !targetDay) return null;
+
+  let targetYear = jstNow.getFullYear();
+  const targetDate = new Date(targetYear, targetMonth - 1, targetDay);
+  if (targetDate < jstNow) targetYear += 1;
+  const finalDate = new Date(targetYear, targetMonth - 1, targetDay);
+
+  const timeMatch = userMessage.match(/(\d{1,2})時/) || userMessage.match(/(\d{1,2}):(\d{2})/);
+  if (timeMatch) {
+    const hour = parseInt(timeMatch[1]);
+    const slotStart = new Date(finalDate);
+    slotStart.setHours(hour, 0, 0, 0);
+    const slotEnd = new Date(finalDate);
+    slotEnd.setHours(hour + 1, 0, 0, 0);
+
+    const isBlocked = blockedRanges.some(range =>
+      slotStart < range.blockEnd && slotEnd > range.blockStart
+    );
+
+    return {
+      dateLabel: `${targetMonth}月${targetDay}日`,
+      hour,
+      available: !isBlocked
+    };
+  }
+
+  return null;
 }
 
 const SYSTEM_PROMPT = `あなたはSBG（経営者団体）のLINE公式アカウントを運営するサポートエージェントです。
 
-【日程調整のルール】
-カレンダー情報が渡されたとき、以下のルールで空き時間を判断してください。
+日程調整について：
+- 空き候補が提供された場合、その候補をそのまま丁寧に伝えてください
+- 候補がない日は提示しないでください
+- 「前後1時間空けた」などの内部的な説明は絶対に書かないでください
+- 候補は日付と時間をシンプルに伝えてください
+- 候補を提示した後は必ず「スタッフより改めて最終確認のご連絡をいたします」と添えてください
+- 指定日時が空いている場合は「空いております」、埋まっている場合は「難しい状況です」と伝えてください
 
-ルール1：ブロック範囲の計算
-予定がある場合、その予定の「開始1時間前」から「終了1時間後」までを完全にブロックします。
-例：11:00〜12:00に予定がある場合 → 10:00〜13:00はすべてNG。候補にできるのは13:00以降か10:00より前。
-例：14:00〜15:00に予定がある場合 → 13:00〜16:00はすべてNG。
-
-ルール2：候補の条件
-・平日（月〜金）のみ
-・9:00〜18:00の範囲内
-・1時間単位のスロット（例：10:00〜11:00、13:00〜14:00など）
-・過去の日時は絶対に含めない
-
-ルール3：候補の提示数
-・異なる日から3件程度を選ぶ
-・なるべく近い日から提示する
-
-ルール4：返答の書き方
-・候補の時間だけをシンプルに書く
-・「前後1時間空けました」などの説明は絶対に書かない
-・丁寧でプロフェッショナルな日本語で書く
-・候補を提示したら最後に「スタッフより改めて最終確認のご連絡をいたします」と添える
-
-【日時指定への対応】
-会員が「〇月〇日の〇時はどうですか？」と聞いてきた場合：
-・その時間がブロック範囲（予定の前後1時間含む）に入っていなければ「空いております」と答える
-・ブロック範囲に入っていれば「その日時は難しい状況です」と答えて別の候補を提示する
-
-【その他の対応】
-・資料・ドキュメントの送付依頼はスタッフにエスカレーションする旨を伝える
-・対応できない内容もスタッフにエスカレーションする旨を伝える
-・常に丁寧でプロフェッショナルな日本語で対応し、SBGの品格を保つ`;
+その他：
+- 資料・ドキュメントの送付依頼はスタッフにエスカレーションする旨を伝えてください
+- 対応できない内容もスタッフにエスカレーションする旨を伝えてください
+- 常に丁寧でプロフェッショナルな日本語で対応し、SBGの品格を保ちます`;
 
 app.post("/webhook", async (req, res) => {
   res.sendStatus(200);
@@ -120,20 +183,35 @@ app.post("/webhook", async (req, res) => {
         /(\d{1,2})月(\d{1,2})日/.test(userMessage) ||
         /(\d{1,2})\/(\d{1,2})/.test(userMessage);
 
+      const hasSpecificDate =
+        /(\d{1,2})月(\d{1,2})日/.test(userMessage) ||
+        /(\d{1,2})\/(\d{1,2})/.test(userMessage);
+
       let calendarInfo = "";
+
       if (isScheduleRelated) {
         try {
-          const calendarText = await getCalendarText();
-          const todayJST = new Date().toLocaleString("ja-JP", {
-            timeZone: "Asia/Tokyo",
-            year: "numeric",
-            month: "long",
-            day: "numeric",
-            weekday: "short",
-            hour: "2-digit",
-            minute: "2-digit"
-          });
-          calendarInfo = `\n\n【現在の日時（日本時間）】${todayJST}\n\n【カレンダーに入っている予定一覧】\n${calendarText}\n\n上記の予定を参考に、各予定の開始1時間前〜終了1時間後をブロックして、空いている時間帯から候補を提示してください。`;
+          if (hasSpecificDate) {
+            const result = await checkSpecificDateTime(userMessage);
+            if (result) {
+              if (result.available) {
+                calendarInfo = `\n\n【確認結果】${result.dateLabel} ${result.hour}:00〜${result.hour + 1}:00 は空いております。`;
+              } else {
+                calendarInfo = `\n\n【確認結果】${result.dateLabel} ${result.hour}:00〜${result.hour + 1}:00 はすでに予定が入っております。`;
+              }
+            }
+            const slots = await computeAvailableSlots();
+            if (slots.length > 0) {
+              calendarInfo += `\n\n【空き日程候補】\n${slots.slice(0, 3).join("\n")}`;
+            }
+          } else {
+            const slots = await computeAvailableSlots();
+            if (slots.length > 0) {
+              calendarInfo = `\n\n【空き日程候補】\n${slots.slice(0, 3).join("\n")}`;
+            } else {
+              calendarInfo = "\n\n【空き日程候補】\n今後60日間で調整可能な日程が見つかりませんでした。";
+            }
+          }
         } catch (error) {
           console.error("カレンダーエラー:", error);
           calendarInfo = "\n\n【カレンダーの取得に失敗しました。スタッフより確認のご連絡をいたします。】";
