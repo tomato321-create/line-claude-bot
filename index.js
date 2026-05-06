@@ -39,12 +39,36 @@ async function fetchEvents() {
     timeZone: "Asia/Tokyo"
   });
 
- const items = response.data.items || [];
+  const items = response.data.items || [];
   console.log(`カレンダー取得件数: ${items.length}件`);
   items.forEach(item => {
     console.log(`予定: ${item.summary} / 開始: ${item.start.dateTime || item.start.date}`);
   });
   return items;
+}
+
+// 連続する時間帯をまとめる（例：9:00〜10:00、10:00〜11:00 → 9:00〜11:00）
+function mergeSlots(hours) {
+  if (hours.length === 0) return [];
+
+  const merged = [];
+  let startHour = hours[0];
+  let prevHour = hours[0];
+
+  for (let i = 1; i < hours.length; i++) {
+    if (hours[i] === prevHour + 1) {
+      // 連続している
+      prevHour = hours[i];
+    } else {
+      // 途切れた
+      merged.push(`${startHour}:00〜${prevHour + 1}:00`);
+      startHour = hours[i];
+      prevHour = hours[i];
+    }
+  }
+  merged.push(`${startHour}:00〜${prevHour + 1}:00`);
+
+  return merged;
 }
 
 async function computeAvailableSlots() {
@@ -68,7 +92,7 @@ async function computeAvailableSlots() {
 
     if (checkDay.getDay() === 0 || checkDay.getDay() === 6) continue;
 
-    const daySlots = [];
+    const freeHours = [];
     for (let hour = 9; hour <= 16; hour++) {
       const slotStart = new Date(checkDay);
       slotStart.setHours(hour, 0, 0, 0);
@@ -82,16 +106,17 @@ async function computeAvailableSlots() {
       );
 
       if (!isBlocked) {
-        daySlots.push(`${hour}:00〜${hour + 1}:00`);
+        freeHours.push(hour);
       }
     }
 
-    if (daySlots.length > 0) {
+    if (freeHours.length > 0) {
       const weekdays = ["日", "月", "火", "水", "木", "金", "土"];
       const month = checkDay.getMonth() + 1;
       const day = checkDay.getDate();
       const weekday = weekdays[checkDay.getDay()];
-      candidates.push(`${month}月${day}日（${weekday}）：${daySlots.join("、")}`);
+      const mergedSlots = mergeSlots(freeHours);
+      candidates.push(`${month}月${day}日（${weekday}）：${mergedSlots.join("、")}`);
     }
   }
 
