@@ -149,12 +149,13 @@ function updateMemberInfo(userId, newInfo) {
 
 // ===== スタッフへのpush通知 =====
 async function notifyStaff(message) {
+  console.log(`スタッフ通知試行: STAFF_USER_ID=${STAFF_USER_ID}`);
   if (!STAFF_USER_ID) {
     console.log("スタッフIDが未設定のため通知スキップ");
     return;
   }
   try {
-    await fetch("https://api.line.me/v2/bot/message/push", {
+    const res = await fetch("https://api.line.me/v2/bot/message/push", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -165,7 +166,8 @@ async function notifyStaff(message) {
         messages: [{ type: "text", text: `【スタッフ通知】\n${message}` }]
       })
     });
-    console.log("スタッフ通知送信完了");
+    const result = await res.json();
+    console.log("スタッフ通知結果:", JSON.stringify(result));
   } catch (error) {
     console.error("スタッフ通知エラー:", error);
   }
@@ -331,7 +333,6 @@ app.post("/webhook", async (req, res) => {
     const sourceType = event.source.type;
     let userMessage = event.message.text;
 
-    // ユーザーIDをログに出す（スタッフID確認用）
     console.log(`ユーザーID: ${userId}`);
 
     // グループはメンションされたときだけ反応
@@ -343,27 +344,15 @@ app.post("/webhook", async (req, res) => {
     console.log(`[${sourceType}] メッセージ: ${userMessage}`);
 
     // ===== 柴田モードに切り替え =====
-    const toShibata =
-      userMessage.includes("経営相談") ||
-      userMessage.includes("事業相談") ||
-      userMessage.includes("雑談") ||
-      userMessage.includes("柴田モード");
-
-    // ===== 通常モードに戻す =====
-    const toAgent =
-      userMessage.includes("エージェントモード") ||
-      userMessage.includes("通常モード") ||
-      userMessage.includes("サポートモード");
-
-    if (toShibata) {
+    if (userMessage === "柴田モード" || userMessage.trim() === "柴田モード") {
       shibataMode.set(userId, true);
       conversations.delete(userId);
-      const reply = await askClaude(userId, userMessage, "", true);
-      await replyToLine(replyToken, `【柴田人格で話します】\n\n${reply}`);
+      await replyToLine(replyToken, "【柴田人格で話します】\n\nどうぞ、お話しください。");
       continue;
     }
 
-    if (toAgent) {
+    // ===== エージェントモードに戻す =====
+    if (userMessage === "エージェントモード" || userMessage.trim() === "エージェントモード") {
       shibataMode.set(userId, false);
       conversations.delete(userId);
       await replyToLine(replyToken, "【サポートエージェントモードに戻りました】\n\nお気軽にご用件をお申し付けください。");
@@ -372,6 +361,7 @@ app.post("/webhook", async (req, res) => {
 
     // ===== 現在のモード =====
     const useShibata = shibataMode.get(userId) || false;
+    console.log(`モード: ${useShibata ? "柴田" : "エージェント"}`);
 
     // ===== 日程関連の処理（エージェントモードのみ）=====
     const isScheduleRelated = !useShibata && (
@@ -392,30 +382,24 @@ app.post("/webhook", async (req, res) => {
         if (hasSpecificDate) {
           const result = await checkSpecificDateTime(userMessage);
           if (result) {
-            if (result.available) {
-              calendarInfo = `\n\n【確認結果】${result.dateLabel} ${result.hour}:00〜${result.hour + 1}:00 は空いております。`;
-            } else {
-              calendarInfo = `\n\n【確認結果】${result.dateLabel} ${result.hour}:00〜${result.hour + 1}:00 はすでに予定が入っております。`;
-            }
+            calendarInfo = result.available
+              ? `\n\n【確認結果】${result.dateLabel} ${result.hour}:00〜${result.hour + 1}:00 は空いております。`
+              : `\n\n【確認結果】${result.dateLabel} ${result.hour}:00〜${result.hour + 1}:00 はすでに予定が入っております。`;
           }
           const slots = await computeAvailableSlots();
           if (slots.length > 0) calendarInfo += `\n\n【空き日程候補】\n${slots.slice(0, 3).join("\n")}`;
-
-          // 日程指定があった場合はスタッフに通知
-          const memberInfo = getMemberInfo(userId);
-          const memberName = memberInfo?.nickname || memberInfo?.name || userId;
-          staffNotification = `${memberName}さんより日程調整の依頼がありました。\n\nメッセージ：${userMessage}\n\nカレンダー確認結果：${calendarInfo.replace(/\n\n/g, "\n")}`;
         } else {
           const slots = await computeAvailableSlots();
           calendarInfo = slots.length > 0
             ? `\n\n【空き日程候補】\n${slots.slice(0, 3).join("\n")}`
             : "\n\n【空き日程候補】\n今後60日間で調整可能な日程が見つかりませんでした。";
-
-          // 日程調整依頼もスタッフに通知
-          const memberInfo = getMemberInfo(userId);
-          const memberName = memberInfo?.nickname || memberInfo?.name || userId;
-          staffNotification = `${memberName}さんより日程調整の依頼がありました。\n\nメッセージ：${userMessage}\n\n提示した候補：${calendarInfo.replace(/\n\n/g, "\n")}`;
         }
+
+        // スタッフへの通知内容を作成
+        const memberInfo = getMemberInfo(userId);
+        const memberName = memberInfo?.nickname || memberInfo?.name || "会員";
+        staffNotification = `${memberName}さんより日程調整の依頼がありました。\n\nメッセージ：${userMessage}\n\n提示した候補：${calendarInfo.replace(/\n\n/g, "\n")}`;
+
       } catch (error) {
         console.error("カレンダーエラー:", error);
         calendarInfo = "\n\n【カレンダーの取得に失敗しました。スタッフより確認のご連絡をいたします。】";
@@ -423,22 +407,23 @@ app.post("/webhook", async (req, res) => {
     }
 
     // エスカレーションが必要なメッセージかチェック
-    const needsEscalation =
+    const needsEscalation = !useShibata && (
       userMessage.includes("資料") ||
       userMessage.includes("ドキュメント") ||
       userMessage.includes("スタッフ") ||
-      userMessage.includes("担当者");
+      userMessage.includes("担当者")
+    );
 
     const reply = await askClaude(userId, userMessage, calendarInfo, useShibata);
     console.log(`返答: ${reply}`);
     await replyToLine(replyToken, reply);
 
-    // スタッフへの通知（日程調整・エスカレーション）
+    // スタッフへの通知
     if (staffNotification) {
       await notifyStaff(staffNotification);
     } else if (needsEscalation) {
       const memberInfo = getMemberInfo(userId);
-      const memberName = memberInfo?.nickname || memberInfo?.name || userId;
+      const memberName = memberInfo?.nickname || memberInfo?.name || "会員";
       await notifyStaff(`${memberName}さんよりスタッフ対応が必要なメッセージがありました。\n\nメッセージ：${userMessage}`);
     }
   }
