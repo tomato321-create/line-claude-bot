@@ -148,4 +148,301 @@ function updateMemberInfo(userId, newInfo) {
 }
 
 // ===== スタッフへのpush通知 =====
-async f
+async function notifyStaff(message) {
+  if (!STAFF_USER_ID) {
+    console.log("スタッフIDが未設定のため通知スキップ");
+    return;
+  }
+  try {
+    await fetch("https://api.line.me/v2/bot/message/push", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${process.env.LINE_CHANNEL_ACCESS_TOKEN}`
+      },
+      body: JSON.stringify({
+        to: STAFF_USER_ID,
+        messages: [{ type: "text", text: `【スタッフ通知】\n${message}` }]
+      })
+    });
+    console.log("スタッフ通知送信完了");
+  } catch (error) {
+    console.error("スタッフ通知エラー:", error);
+  }
+}
+
+// ===== カレンダー =====
+function nowJST() { return new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Tokyo" })); }
+function toJSTDate(date) { return new Date(date.toLocaleString("en-US", { timeZone: "Asia/Tokyo" })); }
+
+async function fetchEvents() {
+  const now = new Date();
+  const twoMonthsLater = new Date();
+  twoMonthsLater.setDate(now.getDate() + 60);
+  const response = await calendar.events.list({
+    calendarId: CALENDAR_ID, timeMin: now.toISOString(), timeMax: twoMonthsLater.toISOString(),
+    singleEvents: true, orderBy: "startTime", timeZone: "Asia/Tokyo"
+  });
+  const items = response.data.items || [];
+  console.log(`カレンダー取得件数: ${items.length}件`);
+  return items;
+}
+
+function mergeSlots(hours) {
+  if (hours.length === 0) return [];
+  const merged = [];
+  let startHour = hours[0], prevHour = hours[0];
+  for (let i = 1; i < hours.length; i++) {
+    if (hours[i] === prevHour + 1) { prevHour = hours[i]; }
+    else { merged.push(`${startHour}:00〜${prevHour + 1}:00`); startHour = hours[i]; prevHour = hours[i]; }
+  }
+  merged.push(`${startHour}:00〜${prevHour + 1}:00`);
+  return merged;
+}
+
+async function computeAvailableSlots() {
+  const events = await fetchEvents();
+  const jstNow = nowJST();
+  const blockedRanges = events.map(event => {
+    const start = toJSTDate(new Date(event.start.dateTime || event.start.date));
+    const end = toJSTDate(new Date(event.end.dateTime || event.end.date));
+    return { blockStart: new Date(start.getTime() - 60 * 60 * 1000), blockEnd: new Date(end.getTime() + 60 * 60 * 1000) };
+  });
+  const candidates = [];
+  for (let dayOffset = 0; dayOffset <= 60 && candidates.length < 5; dayOffset++) {
+    const checkDay = new Date(jstNow);
+    checkDay.setDate(jstNow.getDate() + dayOffset);
+    checkDay.setHours(0, 0, 0, 0);
+    if (checkDay.getDay() === 0 || checkDay.getDay() === 6) continue;
+    const freeHours = [];
+    for (let hour = 9; hour <= 16; hour++) {
+      const slotStart = new Date(checkDay); slotStart.setHours(hour, 0, 0, 0);
+      const slotEnd = new Date(checkDay); slotEnd.setHours(hour + 1, 0, 0, 0);
+      if (slotStart <= jstNow) continue;
+      const isBlocked = blockedRanges.some(r => slotStart < r.blockEnd && slotEnd > r.blockStart);
+      if (!isBlocked) freeHours.push(hour);
+    }
+    if (freeHours.length > 0) {
+      const weekdays = ["日", "月", "火", "水", "木", "金", "土"];
+      candidates.push(`${checkDay.getMonth() + 1}月${checkDay.getDate()}日（${weekdays[checkDay.getDay()]}）：${mergeSlots(freeHours).join("、")}`);
+    }
+  }
+  return candidates;
+}
+
+async function checkSpecificDateTime(userMessage) {
+  const events = await fetchEvents();
+  const jstNow = nowJST();
+  const blockedRanges = events.map(event => {
+    const start = toJSTDate(new Date(event.start.dateTime || event.start.date));
+    const end = toJSTDate(new Date(event.end.dateTime || event.end.date));
+    return { blockStart: new Date(start.getTime() - 60 * 60 * 1000), blockEnd: new Date(end.getTime() + 60 * 60 * 1000) };
+  });
+  const matchMonthDay = userMessage.match(/(\d{1,2})月(\d{1,2})日/);
+  const matchSlash = userMessage.match(/(\d{1,2})\/(\d{1,2})/);
+  let targetMonth = null, targetDay = null;
+  if (matchMonthDay) { targetMonth = parseInt(matchMonthDay[1]); targetDay = parseInt(matchMonthDay[2]); }
+  else if (matchSlash) { targetMonth = parseInt(matchSlash[1]); targetDay = parseInt(matchSlash[2]); }
+  if (!targetMonth || !targetDay) return null;
+  let targetYear = jstNow.getFullYear();
+  if (new Date(targetYear, targetMonth - 1, targetDay) < jstNow) targetYear += 1;
+  const finalDate = new Date(targetYear, targetMonth - 1, targetDay);
+  const timeMatch = userMessage.match(/(\d{1,2})時/) || userMessage.match(/(\d{1,2}):(\d{2})/);
+  if (timeMatch) {
+    const hour = parseInt(timeMatch[1]);
+    const slotStart = new Date(finalDate); slotStart.setHours(hour, 0, 0, 0);
+    const slotEnd = new Date(finalDate); slotEnd.setHours(hour + 1, 0, 0, 0);
+    const isBlocked = blockedRanges.some(r => slotStart < r.blockEnd && slotEnd > r.blockStart);
+    return { dateLabel: `${targetMonth}月${targetDay}日`, hour, available: !isBlocked };
+  }
+  return null;
+}
+
+// ===== Claude API =====
+async function askClaude(userId, userMessage, calendarInfo = "", useShibata = false) {
+  if (!conversations.has(userId)) conversations.set(userId, []);
+  const history = conversations.get(userId);
+
+  const memberInfo = getMemberInfo(userId);
+  const memberContext = memberInfo
+    ? `\n\n【この会員の情報】\n${JSON.stringify(memberInfo, null, 2)}`
+    : "\n\n【この会員の情報】\nまだ情報がありません。会話から収集してください。";
+
+  const systemPrompt = (useShibata ? SHIBATA_PROMPT : AGENT_PROMPT) + memberContext;
+  const messageWithCalendar = calendarInfo ? `${userMessage}${calendarInfo}` : userMessage;
+  history.push({ role: "user", content: messageWithCalendar });
+
+  try {
+    const response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": process.env.ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01"
+      },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 1500,
+        system: systemPrompt,
+        messages: history
+      })
+    });
+
+    const data = await response.json();
+    let fullReply = data.content[0].text;
+
+    const memberUpdateMatch = fullReply.match(/MEMBER_UPDATE:(\{.*?\})/s);
+    if (memberUpdateMatch) {
+      try {
+        updateMemberInfo(userId, JSON.parse(memberUpdateMatch[1]));
+        console.log(`会員情報を更新: ${userId}`);
+      } catch (e) { console.error("会員情報パースエラー:", e); }
+      fullReply = fullReply.replace(/\nMEMBER_UPDATE:(\{.*?\})/s, "").trim();
+    }
+
+    history.push({ role: "assistant", content: fullReply });
+    if (history.length > 20) history.splice(0, 2);
+    return fullReply;
+  } catch (error) {
+    console.error("APIエラー:", error);
+    return "申し訳ございません。一時的なエラーが発生しました。スタッフよりご連絡いたします。";
+  }
+}
+
+// ===== LINEへの返信 =====
+async function replyToLine(replyToken, text) {
+  const trimmed = text.length > 4000 ? text.substring(0, 4000) + "…" : text;
+  await fetch("https://api.line.me/v2/bot/message/reply", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "Authorization": `Bearer ${process.env.LINE_CHANNEL_ACCESS_TOKEN}` },
+    body: JSON.stringify({ replyToken, messages: [{ type: "text", text: trimmed }] })
+  });
+}
+
+// ===== Webhookの処理 =====
+app.post("/webhook", async (req, res) => {
+  res.sendStatus(200);
+
+  for (const event of req.body.events) {
+    if (event.type !== "message" || event.message.type !== "text") continue;
+
+    const userId = event.source.userId;
+    const replyToken = event.replyToken;
+    const sourceType = event.source.type;
+    let userMessage = event.message.text;
+
+    // ユーザーIDをログに出す（スタッフID確認用）
+    console.log(`ユーザーID: ${userId}`);
+
+    // グループはメンションされたときだけ反応
+    if (sourceType === "group" || sourceType === "room") {
+      if (!userMessage.includes(`@${BOT_NAME}`)) continue;
+      userMessage = userMessage.replace(`@${BOT_NAME}`, "").trim();
+    }
+
+    console.log(`[${sourceType}] メッセージ: ${userMessage}`);
+
+    // ===== 柴田モードに切り替え =====
+    const toShibata =
+      userMessage.includes("経営相談") ||
+      userMessage.includes("事業相談") ||
+      userMessage.includes("雑談") ||
+      userMessage.includes("柴田モード");
+
+    // ===== 通常モードに戻す =====
+    const toAgent =
+      userMessage.includes("エージェントモード") ||
+      userMessage.includes("通常モード") ||
+      userMessage.includes("サポートモード");
+
+    if (toShibata) {
+      shibataMode.set(userId, true);
+      conversations.delete(userId);
+      const reply = await askClaude(userId, userMessage, "", true);
+      await replyToLine(replyToken, `【柴田人格で話します】\n\n${reply}`);
+      continue;
+    }
+
+    if (toAgent) {
+      shibataMode.set(userId, false);
+      conversations.delete(userId);
+      await replyToLine(replyToken, "【サポートエージェントモードに戻りました】\n\nお気軽にご用件をお申し付けください。");
+      continue;
+    }
+
+    // ===== 現在のモード =====
+    const useShibata = shibataMode.get(userId) || false;
+
+    // ===== 日程関連の処理（エージェントモードのみ）=====
+    const isScheduleRelated = !useShibata && (
+      userMessage.includes("日程") || userMessage.includes("スケジュール") ||
+      userMessage.includes("予定") || userMessage.includes("打ち合わせ") ||
+      userMessage.includes("ミーティング") || userMessage.includes("会議") ||
+      /(\d{1,2})月(\d{1,2})日/.test(userMessage) || /(\d{1,2})\/(\d{1,2})/.test(userMessage)
+    );
+
+    const hasSpecificDate =
+      /(\d{1,2})月(\d{1,2})日/.test(userMessage) || /(\d{1,2})\/(\d{1,2})/.test(userMessage);
+
+    let calendarInfo = "";
+    let staffNotification = "";
+
+    if (isScheduleRelated) {
+      try {
+        if (hasSpecificDate) {
+          const result = await checkSpecificDateTime(userMessage);
+          if (result) {
+            if (result.available) {
+              calendarInfo = `\n\n【確認結果】${result.dateLabel} ${result.hour}:00〜${result.hour + 1}:00 は空いております。`;
+            } else {
+              calendarInfo = `\n\n【確認結果】${result.dateLabel} ${result.hour}:00〜${result.hour + 1}:00 はすでに予定が入っております。`;
+            }
+          }
+          const slots = await computeAvailableSlots();
+          if (slots.length > 0) calendarInfo += `\n\n【空き日程候補】\n${slots.slice(0, 3).join("\n")}`;
+
+          // 日程指定があった場合はスタッフに通知
+          const memberInfo = getMemberInfo(userId);
+          const memberName = memberInfo?.nickname || memberInfo?.name || userId;
+          staffNotification = `${memberName}さんより日程調整の依頼がありました。\n\nメッセージ：${userMessage}\n\nカレンダー確認結果：${calendarInfo.replace(/\n\n/g, "\n")}`;
+        } else {
+          const slots = await computeAvailableSlots();
+          calendarInfo = slots.length > 0
+            ? `\n\n【空き日程候補】\n${slots.slice(0, 3).join("\n")}`
+            : "\n\n【空き日程候補】\n今後60日間で調整可能な日程が見つかりませんでした。";
+
+          // 日程調整依頼もスタッフに通知
+          const memberInfo = getMemberInfo(userId);
+          const memberName = memberInfo?.nickname || memberInfo?.name || userId;
+          staffNotification = `${memberName}さんより日程調整の依頼がありました。\n\nメッセージ：${userMessage}\n\n提示した候補：${calendarInfo.replace(/\n\n/g, "\n")}`;
+        }
+      } catch (error) {
+        console.error("カレンダーエラー:", error);
+        calendarInfo = "\n\n【カレンダーの取得に失敗しました。スタッフより確認のご連絡をいたします。】";
+      }
+    }
+
+    // エスカレーションが必要なメッセージかチェック
+    const needsEscalation =
+      userMessage.includes("資料") ||
+      userMessage.includes("ドキュメント") ||
+      userMessage.includes("スタッフ") ||
+      userMessage.includes("担当者");
+
+    const reply = await askClaude(userId, userMessage, calendarInfo, useShibata);
+    console.log(`返答: ${reply}`);
+    await replyToLine(replyToken, reply);
+
+    // スタッフへの通知（日程調整・エスカレーション）
+    if (staffNotification) {
+      await notifyStaff(staffNotification);
+    } else if (needsEscalation) {
+      const memberInfo = getMemberInfo(userId);
+      const memberName = memberInfo?.nickname || memberInfo?.name || userId;
+      await notifyStaff(`${memberName}さんよりスタッフ対応が必要なメッセージがありました。\n\nメッセージ：${userMessage}`);
+    }
+  }
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => { console.log(`SBGボット起動中 ポート: ${PORT}`); });
