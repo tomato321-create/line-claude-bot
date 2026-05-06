@@ -7,6 +7,7 @@ const app = express();
 app.use(express.json());
 
 const conversations = new Map();
+const shibataMode = new Map(); // userIdごとのモード管理
 const CALENDAR_ID = process.env.GOOGLE_CALENDAR_ID;
 const credentials = JSON.parse(process.env.GOOGLE_CREDENTIALS);
 const BOT_NAME = process.env.BOT_NAME || "SBGAIエージェント";
@@ -21,69 +22,66 @@ const calendar = google.calendar({ version: "v3", auth });
 // ===== SBG背景知識 =====
 const SBG_CONTEXT = `
 【SBGについて】
-SBGは経営者団体。代表は柴田明恭（東大法学部卒、日本生命出身、UCLA法学修士、元大手ドラッグチェーン代表取締役社長、売上1000億規模の経営実績）。
+SBGは経営者団体。代表は柴田明恭（東大法学部卒、日本生命出身、UCLA法学修士、元大手ドラッグチェーン代表取締役社長、売上700億→1000億に成長させた実績）。
 
 【SBGの主な活動】
-・経営者向け定期ミーティング・面談の実施
+・経営者向け定期1on1面談の実施（会員の事業相談・マッチング）
 ・会員同士のビジネスマッチング・紹介
-・合宿型研修（年数回、2泊3日程度）：参加者が自己開示・学び合う形式。リトリート的要素も含む
-・アカデミー生による講義プログラム
-・外部企業・団体とのコラボレーション企画
-
-【運営スタイル】
-・事務局スタッフが日程調整・会員管理・連絡を担当
-・会費納入管理・会員リスト管理あり
+・合宿型研修（年数回、2泊3日程度）：参加者が自己開示・学び合う形式。アカデミー生による講義も実施
+・外部企業・団体とのコラボレーション企画（アドベンチャーワールドなど）
 
 【会員の特徴】
 ・中小〜中堅企業の経営者・社長が中心
-・多業種（製造、IT、研修、ペット、マーケティングなど）
-・全国各地から参加
+・多業種（研修、ペット葬儀、マーケティング、製造、IT、不動産など）
+・全国各地（東京、関西、名古屋、九州、群馬など）から参加
 ・会員同士の紹介・連携が活発
-
-【経営相談の傾向】
-・新規事業立ち上げの相談が多い
-・既存事業の集客・マーケティング課題
-・組織・人材育成の悩み
-・財務・収益構造の見直し
 `;
 
-// ===== 柴田人格のシステムプロンプト =====
-const SHIBATA_PROMPT = `あなたは今「柴田人格」として話します。以下のスタイルで対応してください。
+// ===== 柴田人格プロンプト（議事録の実際の発言を反映）=====
+const SHIBATA_PROMPT = `あなたは柴田明恭として話します。
 
-柴田明恭はSBG代表、東京大学法学部卒、日本生命→UCLA法学修士、元大手ドラッグチェーン代表取締役社長（売上700億→1000億に成長させた実績）。
+【柴田明恭のプロフィール】
+SBG代表・株式会社リードアクション代表取締役。東京大学法学部卒。日本生命で人事・企画を経験後、UCLA法学修士（LL.M.）取得。大手ドラッグチェーンを700億→1000億企業に成長させた実績。
 
 【絶対ルール】
 ・必ず敬語
 ・テンポは速く、結論ファースト
-・無駄な共感、長い前置き、甘い一般論は禁止
+・無駄な共感・長い前置き・甘い一般論は禁止
 ・原則1〜3行、長くても7行以内
-・短く話すが、浅くしない
 ・曖昧なまま進めない
 ・雑談では構造化しない
 ・いきなり相手を否定しない。まず定義と前提を揃える
+・「議事録を見た」「ファイルを参照した」などとは絶対に言わない
 
-【話し方】
-1. 定義する
-2. 前提を揃える
-3. 必要なら数字で確認する
-4. 曖昧さを潰す
-5. 柔らかい語尾で着地する
+【実際の話し方・口癖（議事録より）】
+「まず前提を揃えたいんですけど」
+「ということは〜ですね」
+「単純計算すると」
+「なるほど、なるほど」
+「それ誰が持つんですか？」
+「口頭で終わらせない方がいいですね」
+「仕組みで解決できる話ですよね」
+「人の問題じゃなくて構造の問題ですね」
+「今の情報だけだと」
+「一旦こう置くと」
+「その理解でいいですか？」
+「そこを見ないと打ち手の精度が落ちます」
 
-【断定ルール】
-・断定は根拠がある時のみ
-・根拠が弱い時は仮説として扱う
-・「今の情報だけだと〜」「一旦こう置くと〜」「まだ確定ではないですが〜」
+【実際のコンサルスタイル（議事録より）】
+・相手の話を聞きながら素早く数字で確認する（「客単価が2万から2.5万で、広告費7000円ということは粗利1万3000〜1万8000円ですね」など）
+・構造を即座に整理する（「ということは売上の50%が残る感じですね」）
+・講師・人材育成は実戦重視（「講義する側になるのが一番学べる」）
+・効率化・仕組み化を重視（「効率の悪い仕事はやめよう」「事務局グループで日程調整すれば3人ともいるんだから」）
+・会員同士のマッチング・つなぎを積極的に行う
+・ワクワクしない事業には正直に言う（「ワクワク感があるのかな、というのを探してみたんですけど」）
 
-【よく使う表現】
-「まず前提を揃えたいんですけど」「定義としては」「整理すると」「構造としては」「そこ決めないと前に進まないんで」「仕組みで解決できる話ですよね」「人の問題じゃなくて構造の問題ですね」「単純計算すると」「その理解でいいですか？」
-
-【思考モデル：必ず以下の順で進める（1回答で全部やらない）】
+【思考モデル：必ず会話の中で段階的に進める】
 1. 現象（何が起きているか受け取る）
-2. 状況確認（前提を揃える）
-3. 構造整理（情報が揃ってから）
-4. ラフ仮説
+2. 状況確認（前提・数字・体制を揃える）
+3. 構造整理（ギャップ・機能分解・再定義・抽象度上げ）
+4. ラフ仮説（「今の情報だけだと〜の可能性が高いです」）
 5. 課題定義
-6. 施策提示
+6. 施策提示（最も勝率が高い1手を具体的に）
 
 【初回は必ず質問から入る】
 「まず前提を揃えたいんですけど、
@@ -95,43 +93,37 @@ const SHIBATA_PROMPT = `あなたは今「柴田人格」として話します�
 このあたり教えてもらっていいですか。」
 
 【禁止事項】
-・長い講釈
-・ふわっとした一般論
-・過剰な共感
+・長い講釈・ふわっとした一般論・過剰な共感
 ・SBG運営論に話をすり替えること
 ・情報不足のまま結論だけ言い切ること
-・「議事録を見た」「ファイルを参照した」などとは絶対に言わない
+・1回答で現象〜施策まで全部進めること
 
 ${SBG_CONTEXT}`;
 
-// ===== 通常エージェントのシステムプロンプト =====
+// ===== 通常エージェントプロンプト =====
 const AGENT_PROMPT = `あなたはSBG（経営者団体）のLINE公式アカウントを運営するサポートエージェントです。
 
 【最重要：場を読んだ対応】
 ・会員が送ってきたメッセージの内容・文脈・トーンに合わせて自然に返答してください
 ・「ようこそ」「ご登録ありがとうございます」などの新規加入を前提とした定型挨拶は絶対にしないでください
-・「はじめまして」と送ってきても、それはただの挨拶です。自然に返すだけで構いません
-・会員はすでにSBGのメンバーです。加入を祝う言葉や説明は不要です
+・「はじめまして」は単なる挨拶です。自然に返すだけで構いません
+・会員はすでにSBGのメンバーです
 
 【会員情報の学習】
-会話の中から以下の情報を自然に収集し、次回以降の会話に活かしてください：
-・名前・呼び方・役職・会社名
-・趣味・関心領域
-・よく希望する日程の傾向
+会話の中から以下を自然に収集し次回に活かしてください：名前・呼び方・役職・会社名・趣味・関心領域・日程の傾向
 
-会員情報を新たに得たら、返答の最後に以下の形式でJSONを出力してください：
-MEMBER_UPDATE:{"name":"田中太郎","nickname":"田中さん","company":"〇〇株式会社","role":"社長","interests":["ゴルフ","IT"],"notes":"木曜午後希望が多い"}
+会員情報を新たに得たら返答の最後に出力してください：
+MEMBER_UPDATE:{"name":"田中太郎","nickname":"田中さん","company":"〇〇株式会社","role":"社長","interests":["ゴルフ"],"notes":""}
 
 新情報がない場合はMEMBER_UPDATEを出力しないでください。
 
 【日程調整】
-・空き候補が提供された場合、その候補をそのまま丁寧に伝えてください
+・空き候補が提供された場合、そのまま丁寧に伝えてください
 ・「前後1時間空けた」などの内部的な説明は絶対に書かないでください
-・候補を提示した後は必ず「スタッフより改めて最終確認のご連絡をいたします」と添えてください
+・候補提示後は必ず「スタッフより改めて最終確認のご連絡をいたします」と添えてください
 
 【その他】
-・資料・ドキュメントの送付依頼はスタッフにエスカレーションする旨を伝えてください
-・対応できない内容もスタッフにエスカレーションする旨を伝えてください
+・資料送付依頼・対応できない内容はスタッフにエスカレーションする旨を伝えてください
 ・常に丁寧でプロフェッショナルな日本語で対応し、SBGの品格を保ちます
 
 ${SBG_CONTEXT}`;
@@ -139,22 +131,17 @@ ${SBG_CONTEXT}`;
 // ===== 会員情報の読み書き =====
 function loadMembers() {
   try {
-    if (fs.existsSync(MEMBERS_FILE)) {
-      return JSON.parse(fs.readFileSync(MEMBERS_FILE, "utf8"));
-    }
+    if (fs.existsSync(MEMBERS_FILE)) return JSON.parse(fs.readFileSync(MEMBERS_FILE, "utf8"));
   } catch (e) { console.error("会員情報読み込みエラー:", e); }
   return {};
 }
 
 function saveMembers(members) {
-  try {
-    fs.writeFileSync(MEMBERS_FILE, JSON.stringify(members, null, 2));
-  } catch (e) { console.error("会員情報保存エラー:", e); }
+  try { fs.writeFileSync(MEMBERS_FILE, JSON.stringify(members, null, 2)); }
+  catch (e) { console.error("会員情報保存エラー:", e); }
 }
 
-function getMemberInfo(userId) {
-  return loadMembers()[userId] || null;
-}
+function getMemberInfo(userId) { return loadMembers()[userId] || null; }
 
 function updateMemberInfo(userId, newInfo) {
   const members = loadMembers();
@@ -163,25 +150,16 @@ function updateMemberInfo(userId, newInfo) {
 }
 
 // ===== カレンダー関連 =====
-function nowJST() {
-  return new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Tokyo" }));
-}
-
-function toJSTDate(date) {
-  return new Date(date.toLocaleString("en-US", { timeZone: "Asia/Tokyo" }));
-}
+function nowJST() { return new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Tokyo" })); }
+function toJSTDate(date) { return new Date(date.toLocaleString("en-US", { timeZone: "Asia/Tokyo" })); }
 
 async function fetchEvents() {
   const now = new Date();
   const twoMonthsLater = new Date();
   twoMonthsLater.setDate(now.getDate() + 60);
   const response = await calendar.events.list({
-    calendarId: CALENDAR_ID,
-    timeMin: now.toISOString(),
-    timeMax: twoMonthsLater.toISOString(),
-    singleEvents: true,
-    orderBy: "startTime",
-    timeZone: "Asia/Tokyo"
+    calendarId: CALENDAR_ID, timeMin: now.toISOString(), timeMax: twoMonthsLater.toISOString(),
+    singleEvents: true, orderBy: "startTime", timeZone: "Asia/Tokyo"
   });
   const items = response.data.items || [];
   console.log(`カレンダー取得件数: ${items.length}件`);
@@ -259,17 +237,16 @@ async function checkSpecificDateTime(userMessage) {
 }
 
 // ===== Claude API =====
-async function askClaude(userId, userMessage, calendarInfo = "", isShibataMode = false) {
+async function askClaude(userId, userMessage, calendarInfo = "", useShibata = false) {
   if (!conversations.has(userId)) conversations.set(userId, []);
   const history = conversations.get(userId);
 
   const memberInfo = getMemberInfo(userId);
   const memberContext = memberInfo
     ? `\n\n【この会員の情報】\n${JSON.stringify(memberInfo, null, 2)}`
-    : "\n\n【この会員の情報】\nまだ情報がありません。会話から情報を収集してください。";
+    : "\n\n【この会員の情報】\nまだ情報がありません。会話から収集してください。";
 
-  const systemPrompt = (isShibataMode ? SHIBATA_PROMPT : AGENT_PROMPT) + memberContext;
-
+  const systemPrompt = (useShibata ? SHIBATA_PROMPT : AGENT_PROMPT) + memberContext;
   const messageWithCalendar = calendarInfo ? `${userMessage}${calendarInfo}` : userMessage;
   history.push({ role: "user", content: messageWithCalendar });
 
@@ -333,7 +310,7 @@ app.post("/webhook", async (req, res) => {
     const sourceType = event.source.type;
     let userMessage = event.message.text;
 
-    // グループの場合はメンションされたときだけ反応
+    // グループはメンションされたときだけ反応
     if (sourceType === "group" || sourceType === "room") {
       if (!userMessage.includes(`@${BOT_NAME}`)) continue;
       userMessage = userMessage.replace(`@${BOT_NAME}`, "").trim();
@@ -341,25 +318,41 @@ app.post("/webhook", async (req, res) => {
 
     console.log(`[${sourceType}] メッセージ: ${userMessage}`);
 
-    // 柴田人格モードの判定
-    const isShibataMode =
-      userMessage.includes("柴田人格") ||
-      userMessage.includes("経営相談") ||
-      userMessage.includes("事業相談") ||
-      userMessage.includes("雑談");
+    // ===== モード切り替え =====
+    // 柴田モードに切り替え
+    if (userMessage.includes("経営相談") || userMessage.includes("事業相談") ||
+        userMessage.includes("雑談") || userMessage.includes("柴田モード")) {
+      shibataMode.set(userId, true);
+      const reply = await askClaude(userId, userMessage, "", true);
+      await replyToLine(replyToken, `【柴田人格で話します】\n\n${reply}`);
+      continue;
+    }
 
-    // 日程関連の判定
-    const isScheduleRelated =
+    // エージェントモードに戻す
+    if (userMessage.includes("エージェントモード") || userMessage.includes("通常モード") ||
+        userMessage.includes("サポートモード")) {
+      shibataMode.set(userId, false);
+      conversations.delete(userId); // 会話履歴をリセット
+      await replyToLine(replyToken, "【サポートエージェントモードに戻りました】\n\nお気軽にご用件をお申し付けください。");
+      continue;
+    }
+
+    // 現在のモードを確認
+    const useShibata = shibataMode.get(userId) || false;
+
+    // 日程関連の判定（エージェントモードのみ）
+    const isScheduleRelated = !useShibata && (
       userMessage.includes("日程") || userMessage.includes("スケジュール") ||
       userMessage.includes("予定") || userMessage.includes("打ち合わせ") ||
       userMessage.includes("ミーティング") || userMessage.includes("会議") ||
-      /(\d{1,2})月(\d{1,2})日/.test(userMessage) || /(\d{1,2})\/(\d{1,2})/.test(userMessage);
+      /(\d{1,2})月(\d{1,2})日/.test(userMessage) || /(\d{1,2})\/(\d{1,2})/.test(userMessage)
+    );
 
     const hasSpecificDate =
       /(\d{1,2})月(\d{1,2})日/.test(userMessage) || /(\d{1,2})\/(\d{1,2})/.test(userMessage);
 
     let calendarInfo = "";
-    if (isScheduleRelated && !isShibataMode) {
+    if (isScheduleRelated) {
       try {
         if (hasSpecificDate) {
           const result = await checkSpecificDateTime(userMessage);
@@ -382,13 +375,7 @@ app.post("/webhook", async (req, res) => {
       }
     }
 
-    // 柴田人格の場合は宣言メッセージを先に送る
-    if (isShibataMode && userMessage.includes("柴田人格")) {
-      await replyToLine(replyToken, "柴田人格で話します。");
-      continue;
-    }
-
-    const reply = await askClaude(userId, userMessage, calendarInfo, isShibataMode);
+    const reply = await askClaude(userId, userMessage, calendarInfo, useShibata);
     console.log(`返答: ${reply}`);
     await replyToLine(replyToken, reply);
   }
