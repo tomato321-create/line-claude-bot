@@ -39,7 +39,12 @@ async function fetchEvents() {
     timeZone: "Asia/Tokyo"
   });
 
-  return response.data.items || [];
+ const items = response.data.items || [];
+  console.log(`カレンダー取得件数: ${items.length}件`);
+  items.forEach(item => {
+    console.log(`予定: ${item.summary} / 開始: ${item.start.dateTime || item.start.date}`);
+  });
+  return items;
 }
 
 async function computeAvailableSlots() {
