@@ -25,7 +25,7 @@ const SBG_CONTEXT = `
 SBGは経営者団体。代表は柴田明恭（東大法学部卒、日本生命出身、UCLA法学修士、元大手ドラッグチェーン代表取締役社長、売上700億→1000億に成長させた実績）。
 
 【SBGの主な活動】
-・経営者向け定期1on1面談の実施（会員の事業相談・マッチング）
+・経営者向けコンサルティングの実施（会員の事業相談・マッチング）
 ・会員同士のビジネスマッチング・紹介
 ・合宿型研修（年数回、2泊3日程度）：参加者が自己開示・学び合う形式
 ・外部企業・団体とのコラボレーション企画
@@ -150,26 +150,47 @@ function updateMemberInfo(userId, newInfo) {
 // ===== スタッフへのpush通知 =====
 async function notifyStaff(message) {
   console.log(`スタッフ通知試行: STAFF_USER_ID=${STAFF_USER_ID}`);
-  if (!STAFF_USER_ID) {
-    console.log("スタッフIDが未設定のため通知スキップ");
-    return;
-  }
+  if (!STAFF_USER_ID) { console.log("スタッフIDが未設定のため通知スキップ"); return; }
   try {
     const res = await fetch("https://api.line.me/v2/bot/message/push", {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${process.env.LINE_CHANNEL_ACCESS_TOKEN}`
-      },
-      body: JSON.stringify({
-        to: STAFF_USER_ID,
-        messages: [{ type: "text", text: `【スタッフ通知】\n${message}` }]
-      })
+      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${process.env.LINE_CHANNEL_ACCESS_TOKEN}` },
+      body: JSON.stringify({ to: STAFF_USER_ID, messages: [{ type: "text", text: `【スタッフ通知】\n${message}` }] })
     });
     const result = await res.json();
     console.log("スタッフ通知結果:", JSON.stringify(result));
   } catch (error) {
     console.error("スタッフ通知エラー:", error);
+  }
+}
+
+// ===== 文脈からモードを判断する =====
+async function judgeMode(userMessage, currentMode) {
+  try {
+    const response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": process.env.ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01"
+      },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 10,
+        system: `以下のメッセージがどのカテゴリか判定してください。
+カテゴリA（柴田モード）：経営相談、事業相談、新規事業、マーケティング、組織、人材、財務、雑談、世間話
+カテゴリB（エージェントモード）：日程調整、スケジュール、資料送付、イベント案内、FAQ、挨拶、事務的な連絡
+
+必ず「A」または「B」の1文字だけ返してください。`,
+        messages: [{ role: "user", content: userMessage }]
+      })
+    });
+    const data = await response.json();
+    const result = data.content[0].text.trim();
+    return result === "A";
+  } catch (e) {
+    console.error("モード判定エラー:", e);
+    return currentMode; // エラー時は現在のモードを維持
   }
 }
 
@@ -343,28 +364,24 @@ app.post("/webhook", async (req, res) => {
 
     console.log(`[${sourceType}] メッセージ: ${userMessage}`);
 
-    // ===== 柴田モードに切り替え =====
-    if (userMessage === "柴田モード" || userMessage.trim() === "柴田モード") {
-      shibataMode.set(userId, true);
+    // ===== 現在のモードを取得 =====
+    const prevMode = shibataMode.get(userId) || false;
+
+    // ===== 文脈からモードを自動判断 =====
+    const newMode = await judgeMode(userMessage, prevMode);
+    shibataMode.set(userId, newMode);
+
+    // モードが切り替わったときだけ宣言・会話履歴リセット
+    const modeChanged = prevMode !== newMode;
+    if (modeChanged) {
       conversations.delete(userId);
-      await replyToLine(replyToken, "【柴田人格で話します】\n\nどうぞ、お話しください。");
-      continue;
+      console.log(`モード切り替え: ${prevMode ? "柴田" : "エージェント"} → ${newMode ? "柴田" : "エージェント"}`);
     }
 
-    // ===== エージェントモードに戻す =====
-    if (userMessage === "エージェントモード" || userMessage.trim() === "エージェントモード") {
-      shibataMode.set(userId, false);
-      conversations.delete(userId);
-      await replyToLine(replyToken, "【サポートエージェントモードに戻りました】\n\nお気軽にご用件をお申し付けください。");
-      continue;
-    }
-
-    // ===== 現在のモード =====
-    const useShibata = shibataMode.get(userId) || false;
-    console.log(`モード: ${useShibata ? "柴田" : "エージェント"}`);
+    console.log(`現在のモード: ${newMode ? "柴田" : "エージェント"}`);
 
     // ===== 日程関連の処理（エージェントモードのみ）=====
-    const isScheduleRelated = !useShibata && (
+    const isScheduleRelated = !newMode && (
       userMessage.includes("日程") || userMessage.includes("スケジュール") ||
       userMessage.includes("予定") || userMessage.includes("打ち合わせ") ||
       userMessage.includes("ミーティング") || userMessage.includes("会議") ||
@@ -394,29 +411,33 @@ app.post("/webhook", async (req, res) => {
             ? `\n\n【空き日程候補】\n${slots.slice(0, 3).join("\n")}`
             : "\n\n【空き日程候補】\n今後60日間で調整可能な日程が見つかりませんでした。";
         }
-
-        // スタッフへの通知内容を作成
         const memberInfo = getMemberInfo(userId);
         const memberName = memberInfo?.nickname || memberInfo?.name || "会員";
         staffNotification = `${memberName}さんより日程調整の依頼がありました。\n\nメッセージ：${userMessage}\n\n提示した候補：${calendarInfo.replace(/\n\n/g, "\n")}`;
-
       } catch (error) {
         console.error("カレンダーエラー:", error);
         calendarInfo = "\n\n【カレンダーの取得に失敗しました。スタッフより確認のご連絡をいたします。】";
       }
     }
 
-    // エスカレーションが必要なメッセージかチェック
-    const needsEscalation = !useShibata && (
-      userMessage.includes("資料") ||
-      userMessage.includes("ドキュメント") ||
-      userMessage.includes("スタッフ") ||
-      userMessage.includes("担当者")
+    const needsEscalation = !newMode && (
+      userMessage.includes("資料") || userMessage.includes("ドキュメント") ||
+      userMessage.includes("スタッフ") || userMessage.includes("担当者")
     );
 
-    const reply = await askClaude(userId, userMessage, calendarInfo, useShibata);
+    // 返答を生成
+    const reply = await askClaude(userId, userMessage, calendarInfo, newMode);
     console.log(`返答: ${reply}`);
-    await replyToLine(replyToken, reply);
+
+    // モード切り替えがあった場合は宣言を先頭に付ける
+    if (modeChanged) {
+      const announcement = newMode
+        ? "【柴田人格で話します】\n\n"
+        : "【サポートエージェントモードに戻りました】\n\n";
+      await replyToLine(replyToken, announcement + reply);
+    } else {
+      await replyToLine(replyToken, reply);
+    }
 
     // スタッフへの通知
     if (staffNotification) {
