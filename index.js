@@ -154,6 +154,7 @@ async function getLineDisplayName(userId) {
       headers: { "Authorization": `Bearer ${process.env.LINE_CHANNEL_ACCESS_TOKEN}` }
     });
     const data = await res.json();
+    console.log(`LINE表示名取得結果: ${JSON.stringify(data)}`);
     return data.displayName || null;
   } catch (e) {
     console.error("表示名取得エラー:", e);
