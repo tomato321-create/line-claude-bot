@@ -147,6 +147,20 @@ function updateMemberInfo(userId, newInfo) {
   saveMembers(members);
 }
 
+// ===== LINEの表示名を取得 =====
+async function getLineDisplayName(userId) {
+  try {
+    const res = await fetch(`https://api.line.me/v2/bot/profile/${userId}`, {
+      headers: { "Authorization": `Bearer ${process.env.LINE_CHANNEL_ACCESS_TOKEN}` }
+    });
+    const data = await res.json();
+    return data.displayName || null;
+  } catch (e) {
+    console.error("表示名取得エラー:", e);
+    return null;
+  }
+}
+
 // ===== スタッフへのpush通知 =====
 async function notifyStaff(message) {
   console.log(`スタッフ通知試行: STAFF_USER_ID=${STAFF_USER_ID}`);
@@ -190,7 +204,7 @@ async function judgeMode(userMessage, currentMode) {
     return result === "A";
   } catch (e) {
     console.error("モード判定エラー:", e);
-    return currentMode; // エラー時は現在のモードを維持
+    return currentMode;
   }
 }
 
@@ -364,6 +378,11 @@ app.post("/webhook", async (req, res) => {
 
     console.log(`[${sourceType}] メッセージ: ${userMessage}`);
 
+    // ===== 会員名を取得（LINEの表示名も含めて）=====
+    const memberInfo = getMemberInfo(userId);
+    const lineDisplayName = await getLineDisplayName(userId);
+    const memberName = memberInfo?.nickname || memberInfo?.name || lineDisplayName || "未登録の会員";
+
     // ===== 現在のモードを取得 =====
     const prevMode = shibataMode.get(userId) || false;
 
@@ -371,7 +390,6 @@ app.post("/webhook", async (req, res) => {
     const newMode = await judgeMode(userMessage, prevMode);
     shibataMode.set(userId, newMode);
 
-    // モードが切り替わったときだけ宣言・会話履歴リセット
     const modeChanged = prevMode !== newMode;
     if (modeChanged) {
       conversations.delete(userId);
@@ -411,8 +429,6 @@ app.post("/webhook", async (req, res) => {
             ? `\n\n【空き日程候補】\n${slots.slice(0, 3).join("\n")}`
             : "\n\n【空き日程候補】\n今後60日間で調整可能な日程が見つかりませんでした。";
         }
-        const memberInfo = getMemberInfo(userId);
-        const memberName = memberInfo?.nickname || memberInfo?.name || "会員";
         staffNotification = `${memberName}さんより日程調整の依頼がありました。\n\nメッセージ：${userMessage}\n\n提示した候補：${calendarInfo.replace(/\n\n/g, "\n")}`;
       } catch (error) {
         console.error("カレンダーエラー:", error);
@@ -425,11 +441,9 @@ app.post("/webhook", async (req, res) => {
       userMessage.includes("スタッフ") || userMessage.includes("担当者")
     );
 
-    // 返答を生成
     const reply = await askClaude(userId, userMessage, calendarInfo, newMode);
     console.log(`返答: ${reply}`);
 
-    // モード切り替えがあった場合は宣言を先頭に付ける
     if (modeChanged) {
       const announcement = newMode
         ? "【柴田人格で話します】\n\n"
@@ -439,12 +453,9 @@ app.post("/webhook", async (req, res) => {
       await replyToLine(replyToken, reply);
     }
 
-    // スタッフへの通知
     if (staffNotification) {
       await notifyStaff(staffNotification);
     } else if (needsEscalation) {
-      const memberInfo = getMemberInfo(userId);
-      const memberName = memberInfo?.nickname || memberInfo?.name || "会員";
       await notifyStaff(`${memberName}さんよりスタッフ対応が必要なメッセージがありました。\n\nメッセージ：${userMessage}`);
     }
   }
